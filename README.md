@@ -24,7 +24,7 @@ $ ibmcloud ce jobrun submit \
 ```
 
 
-### Capture metrics every n minutes/
+### Capture metrics every n minutes
 
 * Create Code Engine job template
 ```
@@ -60,31 +60,34 @@ E.g.
 - `component_name:<app-name>`: Filter for all instances of a specific app, job, or build
 - `name:<instance-name>`: Filter for a specific instance
 
-![IBM Cloud Logs](./imgaes/ibm-cloud-logs--loglines.png)
+![IBM Cloud Logs](./images/ibm-cloud-logs--loglines.png)
 
-### 
+### Log graphs
 
 Best is to create IBM Cloud Logs Board, in order to visualize the CPU and Memory usage per Code Engine component.
 
-- In your log instance navigate to Boards
-- Give it a proper name, enter `metric:instance-resources` as query and submit by clicking `Add Graph`
+1. In your log instance navigate to Boards
+1. Give it a proper name, enter `metric:instance-resources` as query and submit by clicking `Add Graph`
 ![New Board](./images/new-board.png)
-- Now the graph shows the overall amount of logs captured for the specified query per time interval
-![Count of metrics log lines ](./images/count-of-metrics-lines)
-- Click on the filter icon above the graph and put in `metric:instance-resources AND component_name:<app-name>`
-- Switch the metric of the Graph to `Maximums`
-- Below the graph Add a new plot`cpu.usage` as field and choose `ANY` as field values
+1. Now the graph shows the overall amount of logs captured for the specified query per time interval
+![Count of metrics log lines ](./images/count-of-metrics-lines.png)
+1. Click on the filter icon above the graph and put in `metric:instance-resources AND component_name:<app-name>`
+1. Switch the metric of the Graph to `Maximums`
+1. Below the graph Add a new plot`cpu.usage` as field and choose `ANY` as field values
 ![Configure Graph plots](./images/configure-plots.png)
-- Add another plot for the field `memory.usage` and values `ANY`
-- Finally delete the plot `metrics:instance-resources` and adjust the plot colors to your likings
+1. Add another plot for the field `memory.usage` and values `ANY`
+1. Finally delete the plot `metrics:instance-resources` and adjust the plot colors to your likings
 ![Resource Usage graph](./images/resource-usage-graph.png)
-- The usage graph above renders the utilization in % of the CPU and Memory
+1. The usage graph above renders the utilization in % of the CPU and Memory
 
-- Duplicate the graph, change its name to CPU and replace its plots with `cpu.configured` and `cpu.current`.
+#### Add CPU utilization
+1. Duplicate the graph, change its name to CPU and replace its plots with `cpu.configured` and `cpu.current`.
 - The resulting graph will render the acutal CPU usage compared to the configured limit. The the unit is milli vCPUs (1000 -> 1 vCPU).
 ![](./images/cpu-utilization.png)
 
-- Duplicate the graph, change its name to Memory and replace its plots with `memory.configured` and `memory.current`.
-- The resulting graph will render the acutal memory usage compared to the configured limit. The the unit is MB (1000 -> 1 GB).
+
+#### Add memory utilization
+1. Duplicate the graph, change its name to Memory and replace its plots with `memory.configured` and `memory.current`.
+1. The resulting graph will render the acutal memory usage compared to the configured limit. The the unit is MB (1000 -> 1 GB).
 ![](./images/memory-utilization.png)
 
