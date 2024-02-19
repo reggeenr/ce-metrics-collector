@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
@@ -13,6 +16,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/remotecommand"
+	"k8s.io/kubectl/pkg/scheme"
 
 	"k8s.io/metrics/pkg/apis/metrics/v1beta1"
 	metricsv "k8s.io/metrics/pkg/client/clientset/versioned"
@@ -41,6 +46,27 @@ func main() {
 	}
 }
 
+type ComponentType int64
+
+const (
+	Unknown ComponentType = iota
+	App
+	Job
+	Build
+)
+
+func (s ComponentType) String() string {
+	switch s {
+	case App:
+		return "app"
+	case Job:
+		return "job"
+	case Build:
+		return "build"
+	}
+	return "unknown"
+}
+
 type ResourceStats struct {
 	Current    int64 `json:"current"`
 	Configured int64 `json:"configured"`
@@ -48,17 +74,18 @@ type ResourceStats struct {
 }
 
 type InstanceResourceStats struct {
-	Metric        string        `json:"metric"`
-	Name          string        `json:"name"`
-	Parent        string        `json:"parent"`
-	ComponentType string        `json:"component_type"`
-	ComponentName string        `json:"component_name"`
-	Cpu           ResourceStats `json:"cpu"`
-	Memory        ResourceStats `json:"memory"`
-	Message       string        `json:"message"`
+	Metric           string        `json:"metric"`
+	Name             string        `json:"name"`
+	Parent           string        `json:"parent"`
+	ComponentType    string        `json:"component_type"`
+	ComponentName    string        `json:"component_name"`
+	Cpu              ResourceStats `json:"cpu"`
+	Memory           ResourceStats `json:"memory"`
+	EphemeralStorage ResourceStats `json:"ephemeral_storage"`
+	Message          string        `json:"message"`
 }
 
-// helper function that retrieves all pods and all pod metrics
+// Helper function that retrieves all pods and all pod metrics
 // this function creates a structured log line for each pod for which the kube metrics api provides a metric
 func collectInstanceMetrics() {
 
@@ -83,82 +110,118 @@ func collectInstanceMetrics() {
 	// fetch all pod metrics
 	podMetrics := getAllPodMetrics(namespace, config)
 
-	for _, podMetric := range podMetrics {
+	var wg sync.WaitGroup
 
-		componentType := "unknown"
-		if _, ok := podMetric.ObjectMeta.Labels["buildrun.shipwright.io/name"]; ok {
-			componentType = "build"
-		}
-		if _, ok := podMetric.ObjectMeta.Labels["serving.knative.dev/service"]; ok {
-			componentType = "app"
-		}
-		if _, ok := podMetric.ObjectMeta.Labels["codeengine.cloud.ibm.com/job-run"]; ok {
-			componentType = "job"
-		}
+	for _, metric := range podMetrics {
+		wg.Add(1)
 
-		var componentName string
-		var parent string
-		switch componentType {
-		case "job":
-			if val, ok := podMetric.ObjectMeta.Labels["codeengine.cloud.ibm.com/job-definition-name"]; ok {
-				componentName = val
-			} else {
-				componentName = "standalone"
+		go func(podMetric v1beta1.PodMetrics) {
+			defer wg.Done()
+
+			// Determine the component type (either app, job, build or unknown)
+			componentType := determineComponentType(podMetric)
+
+			// Determine the component name
+			var componentName string
+			var parent string
+			switch componentType {
+			case Job:
+				if val, ok := podMetric.ObjectMeta.Labels["codeengine.cloud.ibm.com/job-definition-name"]; ok {
+					componentName = val
+				} else {
+					componentName = "standalone"
+				}
+				parent = podMetric.ObjectMeta.Labels["codeengine.cloud.ibm.com/job-run"]
+			case App:
+				componentName = podMetric.ObjectMeta.Labels["serving.knative.dev/service"]
+				parent = podMetric.ObjectMeta.Labels["serving.knative.dev/revision"]
+			case Build:
+				if val, ok := podMetric.ObjectMeta.Labels["build.shipwright.io/name"]; ok {
+					componentName = val
+				} else {
+					componentName = "standalone"
+				}
+
+				parent = podMetric.ObjectMeta.Labels["buildrun.shipwright.io/name"]
+			default:
+				componentName = "unknown"
 			}
-			parent = podMetric.ObjectMeta.Labels["codeengine.cloud.ibm.com/job-run"]
-		case "app":
-			componentName = podMetric.ObjectMeta.Labels["serving.knative.dev/service"]
-			parent = podMetric.ObjectMeta.Labels["serving.knative.dev/revision"]
-		case "build":
-			if val, ok := podMetric.ObjectMeta.Labels["build.shipwright.io/name"]; ok {
-				componentName = val
-			} else {
-				componentName = "standalone"
+
+			// Determine the actual CPU and memory usage
+			cpuCurrent := podMetric.Containers[0].Usage.Cpu().ToDec().AsApproximateFloat64() * 1000
+			memoryCurrent := podMetric.Containers[0].Usage.Memory().ToDec().AsApproximateFloat64() / 1000 / 1000
+
+			stats := InstanceResourceStats{
+				Metric:        "instance-resources",
+				Name:          podMetric.Name,
+				Parent:        parent,
+				ComponentType: componentType.String(),
+				ComponentName: componentName,
+				Cpu: ResourceStats{
+					Current: int64(cpuCurrent),
+				},
+				Memory: ResourceStats{
+					Current: int64(memoryCurrent),
+				},
 			}
 
-			parent = podMetric.ObjectMeta.Labels["buildrun.shipwright.io/name"]
-		default:
-			componentName = "unknown"
-		}
-		cpuCurrent := podMetric.Containers[0].Usage.Cpu().ToDec().AsApproximateFloat64() * 1000
-		memoryCurrent := podMetric.Containers[0].Usage.Memory().ToDec().AsApproximateFloat64() / 1000 / 1000
+			// Gather the configured resource limits and calculate the usage (in percent)
+			pod := getPod(podMetric.Name, pods)
+			if pod != nil {
 
-		stats := InstanceResourceStats{
-			Metric:        "instance-resources",
-			Name:          podMetric.Name,
-			Parent:        parent,
-			ComponentType: componentType,
-			ComponentName: componentName,
-			Cpu: ResourceStats{
-				Current: int64(cpuCurrent),
-			},
-			Memory: ResourceStats{
-				Current: int64(memoryCurrent),
-			},
-		}
+				userContainerName := getUserContainerName(componentType, *pod)
 
-		pod := getPod(podMetric.Name, pods)
-		if pod != nil {
-			// extract memory and cpu limit
-			cpu, memory := getCpuAndMemoryLimit(componentType, *pod)
+				// determine the actual ephemeral storage usage
+				storageCurrent := obtainDiskUsage(namespace, podMetric.Name, userContainerName, config)
+				stats.EphemeralStorage.Current = int64(storageCurrent)
 
-			cpuLimit := cpu.ToDec().AsApproximateFloat64() * 1000
-			stats.Cpu.Configured = int64(cpuLimit)
-			stats.Cpu.Usage = int64((cpuCurrent / cpuLimit) * 100)
+				// extract memory, cpu and ephemeral storage limits
+				cpu, memory, storage := getCpuMemoryAndStorageLimits(userContainerName, *pod)
 
-			memoryLimit := memory.ToDec().AsApproximateFloat64() / 1000 / 1000
-			stats.Memory.Configured = int64(memoryLimit)
-			stats.Memory.Usage = int64(memoryCurrent / memoryLimit * 100)
-		}
+				cpuLimit := cpu.ToDec().AsApproximateFloat64() * 1000
+				stats.Cpu.Configured = int64(cpuLimit)
+				stats.Cpu.Usage = int64((cpuCurrent / cpuLimit) * 100)
 
-		stats.Message = "Captured metrics of " + stats.ComponentType + " instance '" + stats.Name + "': " + fmt.Sprintf("%d", stats.Cpu.Current) + "m vCPU, " + fmt.Sprintf("%d", stats.Memory.Current) + " MB memory"
+				memoryLimit := memory.ToDec().AsApproximateFloat64() / 1000 / 1000
+				stats.Memory.Configured = int64(memoryLimit)
+				stats.Memory.Usage = int64(memoryCurrent / memoryLimit * 100)
 
-		fmt.Println(ToJSONString(stats))
+				storageLimit := storage.ToDec().AsApproximateFloat64() / 1000 / 1000
+				stats.EphemeralStorage.Configured = int64(storageLimit)
+				stats.EphemeralStorage.Usage = int64(storageCurrent / storageLimit * 100)
+
+			}
+
+			// Compose the log line message
+			stats.Message = "Captured metrics of " + stats.ComponentType + " instance '" + stats.Name + "': " + fmt.Sprintf("%d", stats.Cpu.Current) + "m vCPU, " + fmt.Sprintf("%d", stats.Memory.Current) + " MB memory, " + fmt.Sprintf("%d", stats.EphemeralStorage.Current) + " MB ephemeral storage"
+
+			// Write the stringified JSON struct and make use of IBM Cloud Logs built-in parsing mechanism,
+			// which allows to annotate log lines by providing a JSON object instead of a simple string
+			fmt.Println(ToJSONString(stats))
+
+		}(metric)
 	}
+
+	wg.Wait()
 
 	fmt.Println("Captured pod metrics in " + strconv.FormatInt(time.Since(startTime).Milliseconds(), 10) + "ms")
 }
 
+// Helper function to determine the component type
+func determineComponentType(podMetric v1beta1.PodMetrics) ComponentType {
+	if _, ok := podMetric.ObjectMeta.Labels["buildrun.shipwright.io/name"]; ok {
+		return Build
+	}
+	if _, ok := podMetric.ObjectMeta.Labels["serving.knative.dev/service"]; ok {
+		return App
+	}
+	if _, ok := podMetric.ObjectMeta.Labels["codeengine.cloud.ibm.com/job-run"]; ok {
+		return Job
+	}
+	return Unknown
+}
+
+// Helper function to obtain a pod by its name from a slice of pods
 func getPod(name string, pods []v1.Pod) *v1.Pod {
 	for _, pod := range pods {
 		if pod.Name == name {
@@ -168,7 +231,7 @@ func getPod(name string, pods []v1.Pod) *v1.Pod {
 	return nil
 }
 
-// helper function to retrieve all pods from the Kube API
+// Helper function to retrieve all pods from the Kube API
 func getAllPods(namespace string, config *rest.Config) []v1.Pod {
 
 	// obtain the core clientset
@@ -199,7 +262,83 @@ func getAllPods(namespace string, config *rest.Config) []v1.Pod {
 	return pods
 }
 
-// helper function to retrieve all pod metrics from the Kube API
+// Helper function to retrieve all pods from the Kube API
+func obtainDiskUsage(namespace string, pod string, container string, config *rest.Config) float64 {
+	// fmt.Println("obtainDiskUsage > pod: '" + pod + "', container: '" + container + "'")
+
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		panic(err.Error())
+	}
+
+	// Utilize `du -sm /` to calculate the disk usage
+	cmd := []string{
+		"du",
+		"-sm",
+		"/",
+	}
+
+	// Craft the rest client request
+	req := clientset.CoreV1().RESTClient().Post().Resource("pods").Name(pod).Namespace(namespace).SubResource("exec")
+	option := &v1.PodExecOptions{
+		Container: container,
+		Command:   cmd,
+		Stdin:     false,
+		Stdout:    true,
+		Stderr:    true,
+	}
+	req.VersionedParams(
+		option,
+		scheme.ParameterCodec,
+	)
+	// fmt.Println("obtainDiskUsage - URL: '" + req.URL().String() + "'")
+	exec, reqErr := remotecommand.NewSPDYExecutor(config, "POST", req.URL())
+	if reqErr != nil {
+		fmt.Println("obtainDiskUsage of pod:" + pod + "/container:" + container + " failed POST err - " + reqErr.Error())
+		return float64(0)
+	}
+
+	// Open a stream and wait for the exec operation to finish
+	var outBuf bytes.Buffer
+	var errBuf bytes.Buffer
+	err = exec.StreamWithContext(context.TODO(), remotecommand.StreamOptions{
+		Stdout: &outBuf,
+		Stderr: &errBuf,
+	})
+
+	// Convert the output buffer to a string
+	diskUsageOutputStr := outBuf.String()
+	if len(diskUsageOutputStr) == 0 || diskUsageOutputStr == "<nil>" {
+
+		// Render captured system error messages, in case the stdout stream did not receive any valid content
+		if err != nil {
+			fmt.Println("obtainDiskUsage of pod:" + pod + "/container:" + container + " failed with a stream err - " + err.Error() + " - stderr: '" + errBuf.String() + "'")
+		}
+
+		return float64(0)
+	}
+	// fmt.Println("obtainDiskUsage of pod:" + pod + "/container:" + container + ": '" + diskUsageOutputStr + "'")
+
+	// Parse the output "4000   /" by splitting the words
+	diskUsageOutput := strings.Fields(strings.TrimSuffix(diskUsageOutputStr, "\n"))
+	if len(diskUsageOutput) > 2 {
+		fmt.Println("obtainDiskUsage of pod:" + pod + "/container:" + container + " - len(diskUsageOutput): '" + strconv.Itoa(len(diskUsageOutput)) + "'")
+		return float64(0)
+	}
+
+	// fmt.Println("obtainDiskUsage of pod:" + pod + "/container:" + container + " - diskUsageOutput[0]: '" + diskUsageOutput[0] + "', len(diskUsageOutput): " + strconv.Itoa(len(diskUsageOutput)))
+
+	// Parse the integer string to a float64
+	ephemeralStorage, parseErr := strconv.ParseFloat(diskUsageOutput[0], 64)
+	if parseErr != nil {
+		fmt.Println("obtainDiskUsage of pod:" + pod + "/container:" + container + " failed while parsing the output '" + diskUsageOutput[0] + "' - " + parseErr.Error())
+		return float64(0)
+	}
+
+	return ephemeralStorage
+}
+
+// Helper function to retrieve all pod metrics from the Kube API
 func getAllPodMetrics(namespace string, config *rest.Config) []v1beta1.PodMetrics {
 	// obtain the metrics clientset
 	metricsclientset, err := metricsv.NewForConfig(config)
@@ -229,33 +368,40 @@ func getAllPodMetrics(namespace string, config *rest.Config) []v1beta1.PodMetric
 	return podMetrics
 }
 
+// Helper function to obtain the name of the user container (that should be observed)
+func getUserContainerName(componentType ComponentType, pod v1.Pod) string {
+	if len(pod.Spec.Containers) == 0 {
+		return ""
+	}
+
+	if componentType == App {
+		return "user-container"
+	}
+
+	if componentType == Job || componentType == Build {
+		return pod.Spec.Containers[0].Name
+	}
+
+	return ""
+}
+
 // Helper function to extract CPU and Memory limits from the pod spec
-func getCpuAndMemoryLimit(componentType string, pod v1.Pod) (*resource.Quantity, *resource.Quantity) {
-	if componentType == "job" {
-		if len(pod.Spec.Containers) > 0 {
-			cpuLimit := pod.Spec.Containers[0].Resources.Limits.Cpu()
-			memoryLimit := pod.Spec.Containers[0].Resources.Limits.Memory()
-			return cpuLimit, memoryLimit
-		}
-	} else if componentType == "app" {
-		if len(pod.Spec.Containers) > 0 {
-			for _, container := range pod.Spec.Containers {
-				if container.Name == "user-container" {
-					cpuLimit := container.Resources.Limits.Cpu()
-					memoryLimit := container.Resources.Limits.Memory()
-					return cpuLimit, memoryLimit
-				}
-			}
-		}
-	} else if componentType == "build" {
-		if len(pod.Spec.Containers) > 0 {
-			cpuLimit := pod.Spec.Containers[0].Resources.Limits.Cpu()
-			memoryLimit := pod.Spec.Containers[0].Resources.Limits.Memory()
-			return cpuLimit, memoryLimit
+func getCpuMemoryAndStorageLimits(containerName string, pod v1.Pod) (*resource.Quantity, *resource.Quantity, *resource.Quantity) {
+
+	if len(containerName) == 0 {
+		return nil, nil, nil
+	}
+
+	for _, container := range pod.Spec.Containers {
+		if container.Name == containerName {
+			cpuLimit := container.Resources.Limits.Cpu()
+			memoryLimit := container.Resources.Limits.Memory()
+			storageLimit := container.Resources.Limits.StorageEphemeral()
+			return cpuLimit, memoryLimit, storageLimit
 		}
 	}
 
-	return nil, nil
+	return nil, nil, nil
 }
 
 // Helper function that converts any object into a JSON string representation
