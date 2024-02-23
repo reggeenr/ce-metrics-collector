@@ -104,8 +104,13 @@ func collectInstanceMetrics() {
 	}
 	namespace := string(nsBytes)
 
+	coreClientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		panic(err.Error())
+	}
+
 	// fetches all pods
-	pods := getAllPods(namespace, config)
+	pods := getAllPods(coreClientset, namespace, config)
 
 	// fetch all pod metrics
 	podMetrics := getAllPodMetrics(namespace, config)
@@ -172,7 +177,7 @@ func collectInstanceMetrics() {
 				userContainerName := getUserContainerName(componentType, *pod)
 
 				// determine the actual ephemeral storage usage
-				storageCurrent := obtainDiskUsage(namespace, podMetric.Name, userContainerName, config)
+				storageCurrent := obtainDiskUsage(coreClientset, namespace, podMetric.Name, userContainerName, config)
 				stats.EphemeralStorage.Current = int64(storageCurrent)
 
 				// extract memory, cpu and ephemeral storage limits
@@ -232,20 +237,14 @@ func getPod(name string, pods []v1.Pod) *v1.Pod {
 }
 
 // Helper function to retrieve all pods from the Kube API
-func getAllPods(namespace string, config *rest.Config) []v1.Pod {
-
-	// obtain the core clientset
-	clientset, err := kubernetes.NewForConfig(config)
-	if err != nil {
-		panic(err.Error())
-	}
+func getAllPods(coreClientset *kubernetes.Clientset, namespace string, config *rest.Config) []v1.Pod {
 
 	// fetches all pods
 	pods := []v1.Pod{}
 	var podsContinueToken string
 	podsPagelimit := int64(100)
 	for {
-		podList, err := clientset.CoreV1().Pods(namespace).List(context.TODO(), metav1.ListOptions{Limit: podsPagelimit, Continue: podsContinueToken})
+		podList, err := coreClientset.CoreV1().Pods(namespace).List(context.TODO(), metav1.ListOptions{Limit: podsPagelimit, Continue: podsContinueToken})
 		if err != nil {
 			fmt.Println("Failed to list pods" + err.Error())
 			break
@@ -263,13 +262,8 @@ func getAllPods(namespace string, config *rest.Config) []v1.Pod {
 }
 
 // Helper function to retrieve all pods from the Kube API
-func obtainDiskUsage(namespace string, pod string, container string, config *rest.Config) float64 {
+func obtainDiskUsage(coreClientset *kubernetes.Clientset, namespace string, pod string, container string, config *rest.Config) float64 {
 	// fmt.Println("obtainDiskUsage > pod: '" + pod + "', container: '" + container + "'")
-
-	clientset, err := kubernetes.NewForConfig(config)
-	if err != nil {
-		panic(err.Error())
-	}
 
 	// Utilize `du -sm /` to calculate the disk usage
 	cmd := []string{
@@ -279,7 +273,7 @@ func obtainDiskUsage(namespace string, pod string, container string, config *res
 	}
 
 	// Craft the rest client request
-	req := clientset.CoreV1().RESTClient().Post().Resource("pods").Name(pod).Namespace(namespace).SubResource("exec")
+	req := coreClientset.CoreV1().RESTClient().Post().Resource("pods").Name(pod).Namespace(namespace).SubResource("exec")
 	option := &v1.PodExecOptions{
 		Container: container,
 		Command:   cmd,
@@ -301,7 +295,7 @@ func obtainDiskUsage(namespace string, pod string, container string, config *res
 	// Open a stream and wait for the exec operation to finish
 	var outBuf bytes.Buffer
 	var errBuf bytes.Buffer
-	err = exec.StreamWithContext(context.TODO(), remotecommand.StreamOptions{
+	err := exec.StreamWithContext(context.TODO(), remotecommand.StreamOptions{
 		Stdout: &outBuf,
 		Stderr: &errBuf,
 	})
