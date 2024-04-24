@@ -1,4 +1,4 @@
-FROM icr.io/codeengine/golang:alpine
+FROM golang:alpine
 
 COPY . /
 RUN  go build -o /main /main.go
